@@ -1,4 +1,4 @@
-module github.com/aenix-io/kubectl-ps
+module github.com/jamesholcomb/kubectl-ps
 
 go 1.24.0
 
