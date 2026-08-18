@@ -200,18 +200,19 @@ func canonicalStatuses(in []string) ([]string, error) {
 }
 
 // defaultStatuses returns the -s filter to use: the user-supplied statuses,
-// or Succeeded when -s was not given.
+// or Running when -s was not given.
 func defaultStatuses(in []string) []string {
 	if len(in) == 0 {
-		return []string{"Succeeded"}
+		return []string{"Running"}
 	}
 	return in
 }
 
-// phaseSelector builds a field selector that matches any of the given
-// canonical pod phases (comma = OR).
-func phaseSelector(phases []string) string {
-	return "status.phase=" + strings.Join(phases, ",")
+// phaseSelector builds a field selector matching a single canonical pod
+// phase. Kubernetes field selectors cannot OR multiple values for the same
+// field, so multiple phases are fetched with one selector per phase.
+func phaseSelector(phase string) string {
+	return "status.phase=" + phase
 }
 
 func usage(msg string) {
@@ -235,7 +236,7 @@ Metric flags:
 Options:
     -A                all namespaces / all nodes
     -n <namespace>    select namespace (multiple space-separated allowed)
-    -s <status>       filter pods by phase (default Succeeded; multiple space-separated allowed)
+    -s <status>       filter pods by phase (default Running; multiple space-separated allowed)
     -r                reverse sort
     -h                human-readable units
     -m                mebibytes
@@ -400,7 +401,6 @@ func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string
 
 	ctx := context.Background()
 	usageMap := map[string]struct{ mem, cpu int64 }{}
-	listOpts := metav1.ListOptions{FieldSelector: phaseSelector(phases)}
 
 	if containsRune(cfg.metrics, 'u') && mc != nil {
 		if list, err := mc.MetricsV1beta1().PodMetricses("").List(ctx, metav1.ListOptions{}); err == nil {
@@ -415,23 +415,8 @@ func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string
 		}
 	}
 
-	var pods *corev1.PodList
-	var err error
-	if all {
-		pods, err = cl.CoreV1().Pods("").List(ctx, listOpts)
-		must(err)
-	} else if len(nsList) > 0 {
-		var combined []corev1.Pod
-		for _, ns := range nsList {
-			pl, err := cl.CoreV1().Pods(ns).List(ctx, listOpts)
-			must(err)
-			combined = append(combined, pl.Items...)
-		}
-		pods = &corev1.PodList{Items: combined}
-	} else {
-		pods, err = cl.CoreV1().Pods(curNS).List(ctx, listOpts)
-		must(err)
-	}
+	pods, err := fetchPods(cl, nsList, curNS, all, phases)
+	must(err)
 
 	var rows []podRow
 	for _, p := range pods.Items {
@@ -474,6 +459,31 @@ func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string
 	})
 
 	printPods(rows, cfg, all, fam, u)
+}
+
+// fetchPods lists pods matching any of the given canonical phases, across the
+// selected namespaces: every namespace in nsList when -n was given, curNS
+// otherwise, or all namespaces when all is set. Field selectors cannot OR
+// multiple values for the same field, so one API call is made per phase.
+func fetchPods(cl kubernetes.Interface, nsList []string, curNS string, all bool, phases []string) (*corev1.PodList, error) {
+	if all {
+		nsList = []string{""}
+	} else if len(nsList) == 0 {
+		nsList = []string{curNS}
+	}
+
+	var combined []corev1.Pod
+	for _, ns := range nsList {
+		for _, ph := range phases {
+			pl, err := cl.CoreV1().Pods(ns).List(context.Background(),
+				metav1.ListOptions{FieldSelector: phaseSelector(ph)})
+			if err != nil {
+				return nil, err
+			}
+			combined = append(combined, pl.Items...)
+		}
+	}
+	return &corev1.PodList{Items: combined}, nil
 }
 
 func add64(a, b int64) int64 {

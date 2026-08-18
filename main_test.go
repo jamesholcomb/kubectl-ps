@@ -3,6 +3,11 @@ package main
 import (
 	"reflect"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestParseArgsMultipleNamespaces(t *testing.T) {
@@ -155,19 +160,84 @@ func TestCanonicalStatusesUnknown(t *testing.T) {
 }
 
 func TestDefaultStatuses(t *testing.T) {
-	if got := defaultStatuses(nil); !reflect.DeepEqual(got, []string{"Succeeded"}) {
-		t.Errorf("defaultStatuses(nil) = %v, want [Succeeded]", got)
+	if got := defaultStatuses(nil); !reflect.DeepEqual(got, []string{"Running"}) {
+		t.Errorf("defaultStatuses(nil) = %v, want [Running]", got)
 	}
-	if got := defaultStatuses([]string{"Running"}); !reflect.DeepEqual(got, []string{"Running"}) {
-		t.Errorf("defaultStatuses([Running]) = %v, want [Running]", got)
+	if got := defaultStatuses([]string{"Succeeded"}); !reflect.DeepEqual(got, []string{"Succeeded"}) {
+		t.Errorf("defaultStatuses([Succeeded]) = %v, want [Succeeded]", got)
 	}
 }
 
 func TestPhaseSelector(t *testing.T) {
-	if got := phaseSelector([]string{"Succeeded"}); got != "status.phase=Succeeded" {
+	if got := phaseSelector("Succeeded"); got != "status.phase=Succeeded" {
 		t.Errorf("phaseSelector = %q, want %q", got, "status.phase=Succeeded")
 	}
-	if got := phaseSelector([]string{"Succeeded", "Running"}); got != "status.phase=Succeeded,Running" {
-		t.Errorf("phaseSelector = %q, want %q", got, "status.phase=Succeeded,Running")
+	if got := phaseSelector("Running"); got != "status.phase=Running" {
+		t.Errorf("phaseSelector = %q, want %q", got, "status.phase=Running")
+	}
+}
+
+func TestFetchPodsOneCallPerPhase(t *testing.T) {
+	cl := fake.NewSimpleClientset()
+	var calls []string
+	cl.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		la := action.(k8stesting.ListAction)
+		calls = append(calls, la.GetNamespace()+"|"+la.GetListRestrictions().Fields.String())
+		return true, &corev1.PodList{}, nil
+	})
+
+	_, err := fetchPods(cl, nil, "default", false, []string{"Running", "Succeeded"})
+	if err != nil {
+		t.Fatalf("fetchPods: %v", err)
+	}
+	want := []string{
+		"default|status.phase=Running",
+		"default|status.phase=Succeeded",
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("list calls = %v, want %v", calls, want)
+	}
+}
+
+func TestFetchPodsPerNamespacePerPhase(t *testing.T) {
+	cl := fake.NewSimpleClientset()
+	var calls []string
+	cl.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		la := action.(k8stesting.ListAction)
+		calls = append(calls, la.GetNamespace()+"|"+la.GetListRestrictions().Fields.String())
+		return true, &corev1.PodList{}, nil
+	})
+
+	_, err := fetchPods(cl, []string{"a", "b"}, "ignored", false, []string{"Running", "Failed"})
+	if err != nil {
+		t.Fatalf("fetchPods: %v", err)
+	}
+	want := []string{
+		"a|status.phase=Running",
+		"a|status.phase=Failed",
+		"b|status.phase=Running",
+		"b|status.phase=Failed",
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("list calls = %v, want %v", calls, want)
+	}
+}
+
+func TestFetchPodsAllNamespaces(t *testing.T) {
+	cl := fake.NewSimpleClientset()
+	var calls []string
+	cl.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		la := action.(k8stesting.ListAction)
+		calls = append(calls, la.GetNamespace()+"|"+la.GetListRestrictions().Fields.String())
+		return true, &corev1.PodList{}, nil
+	})
+
+	_, err := fetchPods(cl, []string{"ignored"}, "ignored", true, []string{"Running"})
+	if err != nil {
+		t.Fatalf("fetchPods: %v", err)
+	}
+	want := []string{"|status.phase=Running"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("list calls = %v, want %v", calls, want)
 	}
 }
