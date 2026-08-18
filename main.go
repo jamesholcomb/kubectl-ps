@@ -169,7 +169,7 @@ Metric flags:
 
 Options:
     -A                all namespaces / all nodes
-    -n <namespace>    select namespace
+    -n <namespace>    select namespace (pipe '|' separated list allowed)
     -r                reverse sort
     -h                human-readable units
     -m                mebibytes
@@ -349,12 +349,27 @@ func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string
 		}
 	}
 
-	nsSel := curNS
+	var pods *corev1.PodList
+	var err error
 	if all {
-		nsSel = ""
+		pods, err = cl.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+		must(err)
+	} else if strings.Contains(curNS, "|") {
+		var combined []corev1.Pod
+		for _, ns := range strings.Split(curNS, "|") {
+			ns = strings.TrimSpace(ns)
+			if ns == "" {
+				continue
+			}
+			pl, err := cl.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+			must(err)
+			combined = append(combined, pl.Items...)
+		}
+		pods = &corev1.PodList{Items: combined}
+	} else {
+		pods, err = cl.CoreV1().Pods(curNS).List(ctx, metav1.ListOptions{})
+		must(err)
 	}
-	pods, err := cl.CoreV1().Pods(nsSel).List(ctx, metav1.ListOptions{})
-	must(err)
 
 	var rows []podRow
 	for _, p := range pods.Items {
