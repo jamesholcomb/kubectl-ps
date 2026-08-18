@@ -36,9 +36,18 @@ func isNodeOnly(ch rune) bool { return ch == 'f' || ch == 't' }
 /* ---------- entry point ---------- */
 
 func main() {
-	scope, flagsStr, opts, nsList, err := parseArgs(os.Args[1:])
+	scope, flagsStr, opts, nsList, statusTokens, err := parseArgs(os.Args[1:])
 	if err != nil {
 		usage(err.Error())
+	}
+
+	/* -------- pods scope: -s phase filter (default Succeeded) -------- */
+	var phases []string
+	if scope == "pods" {
+		phases, err = canonicalStatuses(defaultStatuses(statusTokens))
+		if err != nil {
+			usage(err.Error())
+		}
 	}
 
 	/* -------- parse scope / flags -------- */
@@ -92,7 +101,7 @@ func main() {
 	/* -------- dispatch by scope -------- */
 	switch scope {
 	case "pods":
-		runPods(client, mClient, curNS, nsList, allNS,
+		runPods(client, mClient, curNS, nsList, allNS, phases,
 			cfg, famOrder, metricPrimary, reverse, units)
 	case "nodes":
 		runNodes(client, mClient,
@@ -106,12 +115,12 @@ func main() {
 /* ---------- flag parsing ---------- */
 
 // parseArgs splits command-line arguments (excluding the program name)
-// into the canonical scope, the metric-flags string, the option tokens and
-// the namespace list. -n consumes one or more following namespace tokens
-// (space-separated, up to the next option).
-func parseArgs(args []string) (scope, flags string, opts, nsList []string, err error) {
+// into the canonical scope, the metric-flags string, the option tokens, the
+// namespace list and the raw pod-status tokens. -n and -s each consume one
+// or more following non-option tokens (space-separated, up to the next option).
+func parseArgs(args []string) (scope, flags string, opts, nsList, statuses []string, err error) {
 	if len(args) == 0 {
-		return "", "", nil, nil, errors.New("missing scope")
+		return "", "", nil, nil, nil, errors.New("missing scope")
 	}
 
 	scopeArg := args[0]
@@ -122,16 +131,21 @@ func parseArgs(args []string) (scope, flags string, opts, nsList []string, err e
 		/* option (starts with “-”) */
 		if strings.HasPrefix(tok, "-") {
 
-			/* -n takes one or more namespace tokens (up to next option) */
-			if tok == "-n" {
+			/* -n / -s take one or more value tokens (up to next option) */
+			if tok == "-n" || tok == "-s" {
 				count := 0
 				for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
-					nsList = append(nsList, args[i+1])
+					if tok == "-n" {
+						nsList = append(nsList, args[i+1])
+					} else {
+						statuses = append(statuses, args[i+1])
+					}
 					i++
 					count++
 				}
 				if count == 0 {
-					return "", "", nil, nil, errors.New("missing value after -n")
+					return "", "", nil, nil, nil,
+						fmt.Errorf("missing value after %s", tok)
 				}
 				continue
 			}
@@ -144,19 +158,60 @@ func parseArgs(args []string) (scope, flags string, opts, nsList []string, err e
 		if flags == "" {
 			flags = tok
 		} else {
-			return "", "", nil, nil, errors.New("multiple flag strings found")
+			return "", "", nil, nil, nil, errors.New("multiple flag strings found")
 		}
 	}
 
 	if flags == "" {
-		return "", "", nil, nil, errors.New("missing metric flags string")
+		return "", "", nil, nil, nil, errors.New("missing metric flags string")
 	}
 
 	scope, err = parseScope(scopeArg)
 	if err != nil {
-		return "", "", nil, nil, err
+		return "", "", nil, nil, nil, err
 	}
-	return scope, flags, opts, nsList, nil
+	return scope, flags, opts, nsList, statuses, nil
+}
+
+/* ---------- pod phase (status) helpers ---------- */
+
+// phaseNames maps any-case user input to the canonical PodPhase values
+// expected by the Kubernetes API.
+var phaseNames = map[string]string{
+	"pending":   "Pending",
+	"running":   "Running",
+	"succeeded": "Succeeded",
+	"failed":    "Failed",
+	"unknown":   "Unknown",
+}
+
+// canonicalStatuses maps user-supplied status tokens (any case) to the
+// canonical PodPhase values used in API field selectors.
+func canonicalStatuses(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		canon, ok := phaseNames[strings.ToLower(s)]
+		if !ok {
+			return nil, fmt.Errorf("unknown status %q", s)
+		}
+		out = append(out, canon)
+	}
+	return out, nil
+}
+
+// defaultStatuses returns the -s filter to use: the user-supplied statuses,
+// or Succeeded when -s was not given.
+func defaultStatuses(in []string) []string {
+	if len(in) == 0 {
+		return []string{"Succeeded"}
+	}
+	return in
+}
+
+// phaseSelector builds a field selector that matches any of the given
+// canonical pod phases (comma = OR).
+func phaseSelector(phases []string) string {
+	return "status.phase=" + strings.Join(phases, ",")
 }
 
 func usage(msg string) {
@@ -180,6 +235,7 @@ Metric flags:
 Options:
     -A                all namespaces / all nodes
     -n <namespace>    select namespace (multiple space-separated allowed)
+    -s <status>       filter pods by phase (default Succeeded; multiple space-separated allowed)
     -r                reverse sort
     -h                human-readable units
     -m                mebibytes
@@ -339,11 +395,12 @@ func newMetricMap(metrics []rune) map[rune]int64 {
 	return m
 }
 
-func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string, nsList []string, all bool,
+func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string, nsList []string, all bool, phases []string,
 	cfg columnCfg, fam rune, metric rune, rev bool, u unitKind) {
 
 	ctx := context.Background()
 	usageMap := map[string]struct{ mem, cpu int64 }{}
+	listOpts := metav1.ListOptions{FieldSelector: phaseSelector(phases)}
 
 	if containsRune(cfg.metrics, 'u') && mc != nil {
 		if list, err := mc.MetricsV1beta1().PodMetricses("").List(ctx, metav1.ListOptions{}); err == nil {
@@ -361,18 +418,18 @@ func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string
 	var pods *corev1.PodList
 	var err error
 	if all {
-		pods, err = cl.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+		pods, err = cl.CoreV1().Pods("").List(ctx, listOpts)
 		must(err)
 	} else if len(nsList) > 0 {
 		var combined []corev1.Pod
 		for _, ns := range nsList {
-			pl, err := cl.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+			pl, err := cl.CoreV1().Pods(ns).List(ctx, listOpts)
 			must(err)
 			combined = append(combined, pl.Items...)
 		}
 		pods = &corev1.PodList{Items: combined}
 	} else {
-		pods, err = cl.CoreV1().Pods(curNS).List(ctx, metav1.ListOptions{})
+		pods, err = cl.CoreV1().Pods(curNS).List(ctx, listOpts)
 		must(err)
 	}
 

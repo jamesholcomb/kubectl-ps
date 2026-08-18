@@ -38,6 +38,9 @@ kubectl ps ns mrlp -A
 # Pods in multiple namespaces
 kubectl ps pods mcur -n default kube-system -t
 
+# Only running/failed pods (any case accepted); defaults to Succeeded
+kubectl ps pods mcur -s running failed -A
+
 # Show allocatable, available and percent on nodes
 kubectl ps nodes cmafprl -t
 ```
@@ -60,14 +63,15 @@ Metric flags:
                    t  total (nodes only)
 
 Options:
-    -A                all namespaces / all nodes
-    -n <ns1> <n2> ... select namespaces
-    -r                reverse sort
-    -h                human-readable units
-    -m                mebibytes
-    -g                gibibytes
-    -b                bytes
-    -t                show TOTAL
+    -A                 all namespaces / all nodes
+    -n <ns1> <ns2> ... select namespaces
+    -s <status> ...    filter pods by phase (default Succeeded)
+    -r                 reverse sort
+    -h                 human-readable units
+    -m                 mebibytes
+    -g                 gibibytes
+    -b                 bytes
+    -t                 show TOTAL
 ```
 
 
