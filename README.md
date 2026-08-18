@@ -35,6 +35,9 @@ kubectl ps pods curn
 # Memory requests / limits / percent for all namespaces
 kubectl ps ns mrlp -A
 
+# Pods in multiple namespaces
+kubectl ps pods mcur -n default kube-system -t
+
 # Show allocatable, available and percent on nodes
 kubectl ps nodes cmafprl -t
 ```
@@ -58,7 +61,7 @@ Metric flags:
 
 Options:
     -A                all namespaces / all nodes
-    -n <namespace>    select namespace
+    -n <ns1> <n2> ... select namespaces
     -r                reverse sort
     -h                human-readable units
     -m                mebibytes

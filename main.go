@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -35,66 +36,24 @@ func isNodeOnly(ch rune) bool { return ch == 'f' || ch == 't' }
 /* ---------- entry point ---------- */
 
 func main() {
-	args := os.Args[1:]
-	if len(args) == 0 {
-		usage("missing scope")
-	}
-
-	/* -------- positional scope -------- */
-	scopeArg := args[0]
-
-	/* -------- find <flags> token & collect options -------- */
-	var flagsStr string
-	var opts []string
-
-	for i := 1; i < len(args); i++ {
-		tok := args[i]
-
-		/* option (starts with “-”) */
-		if strings.HasPrefix(tok, "-") {
-			opts = append(opts, tok)
-
-			/* -n expects value */
-			if tok == "-n" {
-				if i+1 >= len(args) {
-					usage("missing value after -n")
-				}
-				opts = append(opts, args[i+1])
-				i++
-			}
-			continue
-		}
-
-		/* first non-option token is flags string */
-		if flagsStr == "" {
-			flagsStr = tok
-		} else {
-			usage("multiple flag strings found")
-		}
-	}
-
-	if flagsStr == "" {
-		usage("missing metric flags string")
+	scope, flagsStr, opts, nsList, err := parseArgs(os.Args[1:])
+	if err != nil {
+		usage(err.Error())
 	}
 
 	/* -------- parse scope / flags -------- */
-	scope := parseScope(scopeArg)
 	cfg := parseFlags(flagsStr, scope)
 	famOrder, metricPrimary := detectSort(flagsStr)
 
 	/* -------- option variables -------- */
 	allNS, reverse := false, false
 	units := unitHuman
-	nsOverride := ""
 
 	/* -------- handle options -------- */
-	for i := 0; i < len(opts); i++ {
-		switch opts[i] {
+	for _, opt := range opts {
+		switch opt {
 		case "-A":
 			allNS = true
-		case "-n":
-			nsOverride = opts[i+1]
-			i++
 		case "-r":
 			reverse = true
 		case "-h":
@@ -110,15 +69,12 @@ func main() {
 		case "--help":
 			usage("")
 		default:
-			usage("unknown option " + opts[i])
+			usage("unknown option " + opt)
 		}
 	}
 
 	/* -------- kube config -------- */
 	restCfg, curNS := mustBuildConfig()
-	if nsOverride != "" {
-		curNS = nsOverride
-	}
 	client := mustClient(restCfg)
 
 	/* -------- metrics client (if needed) -------- */
@@ -136,7 +92,7 @@ func main() {
 	/* -------- dispatch by scope -------- */
 	switch scope {
 	case "pods":
-		runPods(client, mClient, curNS, allNS,
+		runPods(client, mClient, curNS, nsList, allNS,
 			cfg, famOrder, metricPrimary, reverse, units)
 	case "nodes":
 		runNodes(client, mClient,
@@ -149,11 +105,65 @@ func main() {
 
 /* ---------- flag parsing ---------- */
 
+// parseArgs splits command-line arguments (excluding the program name)
+// into the canonical scope, the metric-flags string, the option tokens and
+// the namespace list. -n consumes one or more following namespace tokens
+// (space-separated, up to the next option).
+func parseArgs(args []string) (scope, flags string, opts, nsList []string, err error) {
+	if len(args) == 0 {
+		return "", "", nil, nil, errors.New("missing scope")
+	}
+
+	scopeArg := args[0]
+
+	for i := 1; i < len(args); i++ {
+		tok := args[i]
+
+		/* option (starts with “-”) */
+		if strings.HasPrefix(tok, "-") {
+
+			/* -n takes one or more namespace tokens (up to next option) */
+			if tok == "-n" {
+				count := 0
+				for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+					nsList = append(nsList, args[i+1])
+					i++
+					count++
+				}
+				if count == 0 {
+					return "", "", nil, nil, errors.New("missing value after -n")
+				}
+				continue
+			}
+
+			opts = append(opts, tok)
+			continue
+		}
+
+		/* first non-option token is flags string */
+		if flags == "" {
+			flags = tok
+		} else {
+			return "", "", nil, nil, errors.New("multiple flag strings found")
+		}
+	}
+
+	if flags == "" {
+		return "", "", nil, nil, errors.New("missing metric flags string")
+	}
+
+	scope, err = parseScope(scopeArg)
+	if err != nil {
+		return "", "", nil, nil, err
+	}
+	return scope, flags, opts, nsList, nil
+}
+
 func usage(msg string) {
 	if msg != "" {
 		fmt.Fprintln(os.Stderr, "Error:", msg)
 	}
-	fmt.Fprintln(os.Stderr, `Usage:
+	fmt.Fprint(os.Stderr, `Usage:
     kubectl ps <pods|nodes|namespaces> <flags> [options]
 
 Scopes:
@@ -169,7 +179,7 @@ Metric flags:
 
 Options:
     -A                all namespaces / all nodes
-    -n <namespace>    select namespace (pipe '|' separated list allowed)
+    -n <namespace>    select namespace (multiple space-separated allowed)
     -r                reverse sort
     -h                human-readable units
     -m                mebibytes
@@ -180,17 +190,16 @@ Options:
 	os.Exit(1)
 }
 
-func parseScope(s string) string {
+func parseScope(s string) (string, error) {
 	switch strings.ToLower(s) {
 	case "pod", "pods", "po", "p":
-		return "pods"
+		return "pods", nil
 	case "node", "nodes", "no", "n":
-		return "nodes"
+		return "nodes", nil
 	case "ns", "namespace", "namespaces":
-		return "namespaces"
+		return "namespaces", nil
 	default:
-		usage("unknown scope " + s)
-		return ""
+		return "", fmt.Errorf("unknown scope %s", s)
 	}
 }
 
@@ -330,7 +339,7 @@ func newMetricMap(metrics []rune) map[rune]int64 {
 	return m
 }
 
-func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string, all bool,
+func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string, nsList []string, all bool,
 	cfg columnCfg, fam rune, metric rune, rev bool, u unitKind) {
 
 	ctx := context.Background()
@@ -354,13 +363,9 @@ func runPods(cl *kubernetes.Clientset, mc *metricsclient.Clientset, curNS string
 	if all {
 		pods, err = cl.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
 		must(err)
-	} else if strings.Contains(curNS, "|") {
+	} else if len(nsList) > 0 {
 		var combined []corev1.Pod
-		for _, ns := range strings.Split(curNS, "|") {
-			ns = strings.TrimSpace(ns)
-			if ns == "" {
-				continue
-			}
+		for _, ns := range nsList {
 			pl, err := cl.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 			must(err)
 			combined = append(combined, pl.Items...)
